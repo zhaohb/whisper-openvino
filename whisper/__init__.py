@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from .audio import load_audio, log_mel_spectrogram, pad_or_trim
 from .decoding import DecodingOptions, DecodingResult, decode, detect_language
-from .model import Whisper, ModelDimensions
+from .model import Whisper, ModelDimensions, DEFAULT_ENCODER_DEVICE, DEFAULT_DECODER_DEVICE
 from .transcribe import transcribe
 
 
@@ -65,7 +65,12 @@ def available_models() -> List[str]:
     return list(_MODELS.keys())
 
 
-def load_model(name: str) -> Whisper:
+def load_model(
+    name: str,
+    device: Optional[str] = None,
+    encoder_device: Optional[str] = None,
+    decoder_device: Optional[str] = None,
+) -> Whisper:
     """
     Load a Whisper ASR model
 
@@ -74,12 +79,25 @@ def load_model(name: str) -> Whisper:
     name : str
         one of the official model names listed by `whisper.available_models()`, or
         path to a model checkpoint containing the model dimensions and the model state_dict.
+    device : str, optional
+        OpenVINO device applied to BOTH encoder and decoder (e.g. "CPU", "GPU",
+        "NPU", "AUTO"). Convenience shortcut; overridden by the per-model
+        arguments below when those are given.
+    encoder_device : str, optional
+        OpenVINO device for the audio encoder. The encoder has static shapes and
+        compiles on NPU/GPU/CPU. Defaults to `device` or "CPU".
+    decoder_device : str, optional
+        OpenVINO device for the text decoder. The decoder uses a dynamic-shape
+        KV-cache that the NPU cannot compile, so prefer "CPU" or "GPU".
+        Defaults to `device` or "CPU".
 
     Returns
     -------
     model : Whisper
         The Whisper ASR model instance
     """
+    enc_device = encoder_device or device or DEFAULT_ENCODER_DEVICE
+    dec_device = decoder_device or device or DEFAULT_DECODER_DEVICE
 
     if name == "tiny":
         dims_config = {'n_mels': 80, 'n_vocab': 51865, 'n_audio_ctx': 1500, 'n_audio_state': 384, 'n_audio_head': 6, 'n_audio_layer': 4, 'n_text_ctx': 448, 'n_text_state': 384, 'n_text_head': 6, 'n_text_layer': 4}
@@ -101,5 +119,5 @@ def load_model(name: str) -> Whisper:
         raise ValueError(f"model type {name} not supported")
 
     dims = ModelDimensions(**dims_config)
-    model = Whisper(dims, name)
+    model = Whisper(dims, name, encoder_device=enc_device, decoder_device=dec_device)
     return model

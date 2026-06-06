@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 import numpy as np
 import torch
@@ -11,6 +11,17 @@ from openvino import Core
 
 from .transcribe import transcribe as transcribe_function
 from .decoding import detect_language as detect_language_function, decode as decode_function
+
+
+# Default OpenVINO device for each sub-model.
+#
+# The encoder has fully static shapes and compiles on any device including the
+# NPU. The decoder runs autoregressively with a growing KV-cache, producing
+# dynamic (unbounded) tensor shapes that the NPU compiler rejects ("Upper
+# bounds are not specified"); it therefore defaults to CPU. Override per call
+# via ``load_model(name, device=..., encoder_device=..., decoder_device=...)``.
+DEFAULT_ENCODER_DEVICE = "CPU"
+DEFAULT_DECODER_DEVICE = "CPU"
 
 
 @dataclass
@@ -27,16 +38,36 @@ class ModelDimensions:
     n_text_layer: int
 
 
+def _compile_with_fallback(core: Core, model, device: str, what: str):
+    """Compile ``model`` on ``device``; fall back to CPU if that device can't.
+
+    Intel NPU/GPU reject models with unbounded dynamic shapes (the Whisper
+    decoder) and some driver/hardware combos are missing entirely. Rather than
+    crash, we log the reason and retry on CPU so transcription always works.
+    """
+    try:
+        return core.compile_model(model, device)
+    except Exception as exc:  # noqa: BLE001
+        if device.upper() == "CPU":
+            raise
+        print(
+            f"[whisper-openvino] {what}: could not compile on {device} "
+            f"({type(exc).__name__}: {str(exc)[:120]}...); falling back to CPU"
+        )
+        return core.compile_model(model, "CPU")
+
+
 class OpenVinoAudioEncoder(nn.Module):
-    def __init__(self, model: str):
+    def __init__(self, model: str, device: str = DEFAULT_ENCODER_DEVICE):
         super().__init__()
 
+        self.device = device
         self.core = Core()
         self._model = self.core.read_model(
             hf_hub_download(repo_id=f"zhuzilin/whisper-openvino-{model}", filename="encoder.xml"),
             hf_hub_download(repo_id=f"zhuzilin/whisper-openvino-{model}", filename="encoder.bin"),
         )
-        self.model = self.core.compile_model(self._model, "CPU")
+        self.model = _compile_with_fallback(self.core, self._model, device, "encoder")
 
     def forward(self, x: Tensor):
         result = self.model(
@@ -48,15 +79,16 @@ class OpenVinoAudioEncoder(nn.Module):
 
 
 class OpenVinoTextDecoder(nn.Module):
-    def __init__(self, model: str):
+    def __init__(self, model: str, device: str = DEFAULT_DECODER_DEVICE):
         super().__init__()
 
+        self.device = device
         self.core = Core()
         self._model = self.core.read_model(
             hf_hub_download(repo_id=f"zhuzilin/whisper-openvino-{model}", filename="decoder.xml"),
             hf_hub_download(repo_id=f"zhuzilin/whisper-openvino-{model}", filename="decoder.bin"),
         )
-        self.model = self.core.compile_model(self._model, "CPU")
+        self.model = _compile_with_fallback(self.core, self._model, device, "decoder")
 
     def forward(self, x: Tensor, xa: Union[Tensor, np.ndarray], kv_cache: Tensor, offset: int):
         output = self.model(
@@ -73,12 +105,18 @@ class OpenVinoTextDecoder(nn.Module):
 
 
 class Whisper(nn.Module):
-    def __init__(self, dims: ModelDimensions, model: str):
+    def __init__(
+        self,
+        dims: ModelDimensions,
+        model: str,
+        encoder_device: str = DEFAULT_ENCODER_DEVICE,
+        decoder_device: str = DEFAULT_DECODER_DEVICE,
+    ):
         super().__init__()
         self.type = model
         self.dims = dims
-        self.encoder = OpenVinoAudioEncoder(model=model)
-        self.decoder = OpenVinoTextDecoder(model=model)
+        self.encoder = OpenVinoAudioEncoder(model=model, device=encoder_device)
+        self.decoder = OpenVinoTextDecoder(model=model, device=decoder_device)
 
     def embed_audio(self, mel: torch.Tensor):
         return self.encoder.forward(mel)
